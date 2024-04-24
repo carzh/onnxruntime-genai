@@ -60,40 +60,36 @@ class Model:
         }
 
         # Map input names to their types and shapes
-        self.input_names = ["input_ids", "attention_mask", "position_ids"]
+        self.input_names = ["input_ids", "attention_mask", "position_ids", "labels"]
         self.input_types = {
             "input_ids": TensorProto.INT64,                                                                      # For standard models
             "attention_mask": TensorProto.INT64,                                                                 # For standard models
             "position_ids": TensorProto.INT64,                                                                   # For standard models
+            "labels": TensorProto.INT64,
             "inputs_embeds": self.io_dtype,                                                                      # For standard models where you want to remove the embedding layer from the model (note that `inputs_embeds` is written this way to match Hugging Face format)
-            "past_key_values.key": self.io_dtype,                                                                # For standard models (note that `past_key_values.key` is written this way to match Hugging Face format)
-            "past_key_values.value": self.io_dtype,                                                              # For standard models (note that `past_key_values.value` is written this way to match Hugging Face format)
         }
         self.input_shapes = {
             "input_ids": ["batch_size", "sequence_length"],                                                      # For standard models
             "attention_mask": ["batch_size", "total_sequence_length"],                                           # For standard models
             "position_ids": ["batch_size", "sequence_length"],                                                   # For standard models
+            "labels": ["batch_size", "sequence_length"],                                                   # For standard models
             "inputs_embeds": ["batch_size", "sequence_length", self.hidden_size],                                # For standard models where you want to remove the embedding layer from the model (note that `inputs_embeds` is written this way to match Hugging Face format)
-            "past_key_values.key": ["batch_size", self.num_kv_heads, "past_sequence_length", self.head_size],    # For standard models (note that `past_key_values.key` is written this way to match Hugging Face format)
-            "past_key_values.value": ["batch_size", self.num_kv_heads, "past_sequence_length", self.head_size],  # For standard models (note that `past_key_values.value` is written this way to match Hugging Face format)
         }
         self.exclude_embeds = "exclude_embeds" in extra_options
         if self.exclude_embeds:
             self.input_names = [name.replace("input_ids", "inputs_embeds") for name in self.input_names]
 
         # Map output names to their types and shapes
-        self.output_names = ["logits"]
+        self.output_names = ["logits", "loss"]
         self.output_types = {
             "hidden_states": self.io_dtype,                                                                      # For standard models where you want to remove the language modeling head from the model (note that `hidden_states` is written this way to match Hugging Face format)
             "logits": self.io_dtype,                                                                             # For standard models
-            "present.key": self.io_dtype,                                                                        # For standard models (note that `present.key` is written this way to match Hugging Face format)
-            "present.value": self.io_dtype,                                                                      # For standard models (note that `present.value` is written this way to match Hugging Face format)
+            "loss": TensorProto.FLOAT,                                                                          # For standard models
         }
         self.output_shapes = {
             "hidden_states": ["batch_size", "sequence_length", self.hidden_size],                                # For standard models where you want to remove the language modeling head from the model (note that `hidden_states` is written this way to match Hugging Face format)
             "logits": ["batch_size", "sequence_length", self.vocab_size],                                        # For standard models
-            "present.key": ["batch_size", self.num_kv_heads, "total_sequence_length", self.head_size],           # For standard models (note that `present.key` is written this way to match Hugging Face format)
-            "present.value": ["batch_size", self.num_kv_heads, "total_sequence_length", self.head_size],         # For standard models (note that `present.value` is written this way to match Hugging Face format)
+            "loss": [1],
         }
         self.exclude_lm_head = "exclude_lm_head" in extra_options
         if self.exclude_lm_head:
@@ -200,10 +196,6 @@ class Model:
     def make_genai_config(self, model_name_or_path, extra_kwargs, out_dir):
         config = GenerationConfig.from_pretrained(model_name_or_path, **extra_kwargs)
         inputs = dict(zip(self.input_names, self.input_names))
-        inputs.update({
-            "past_key_names": "past_key_values.%d.key",
-            "past_value_names": "past_key_values.%d.value",
-        })
         genai_config = {
             "model": {
                 "bos_token_id": config.bos_token_id,
@@ -219,12 +211,9 @@ class Model:
                     "inputs": inputs,
                     "outputs": {
                         "logits": "logits",
-                        "present_key_names": "present.%d.key",
-                        "present_value_names": "present.%d.value",
                     },
                     "num_attention_heads": self.num_attn_heads,
                     "num_hidden_layers": self.num_layers,
-                    "num_key_value_heads": self.num_kv_heads,
                 },
                 "eos_token_id": config.eos_token_id,
                 "pad_token_id": config.pad_token_id if hasattr(config, "pad_token_id") and config.pad_token_id is not None else config.eos_token_id,
@@ -400,20 +389,6 @@ class Model:
             dtype = self.output_types[name]
             shape = self.output_shapes[name]
             outputs.append(helper.make_tensor_value_info(name, dtype, shape=shape))
-
-        # Add KV cache to inputs and outputs
-        for i in range(self.num_layers):
-            # Add KV cache to inputs
-            key_name = f"past_key_values.{i}.key"
-            inputs.append(helper.make_tensor_value_info(key_name, self.input_types["past_key_values.key"], shape=self.input_shapes["past_key_values.key"]))
-            value_name = f"past_key_values.{i}.value"
-            inputs.append(helper.make_tensor_value_info(value_name, self.input_types["past_key_values.value"], shape=self.input_shapes["past_key_values.value"]))
-
-            # Add KV cache to outputs
-            key_name = f"present.{i}.key"
-            outputs.append(helper.make_tensor_value_info(key_name, self.output_types["present.key"], shape=self.output_shapes["present.key"]))
-            value_name = f"present.{i}.value"
-            outputs.append(helper.make_tensor_value_info(value_name, self.output_types["present.value"], shape=self.output_shapes["present.value"]))
 
         self.inputs = inputs
         self.outputs = outputs
@@ -1175,6 +1150,49 @@ class Model:
             # Norm after last decoder layer of model (last layer --> norm)
             self.layernorm_attrs["last_layernorm"] = True
 
+    def make_loss(self, name):
+        self.make_constant("model/constants/TensorProto.INT64/0D/1");
+        self.make_constant("model/constants/TensorProto.INT64/0D/-1");
+        self.make_constant("model/constants/TensorProto.INT64/0D/0");
+        self.make_constant("model/constants/TensorProto.INT64/1D/[-1, 32064]");
+
+        self.make_unsqueeze("model/unsqueeze/1", ["model/constants/TensorProto.INT64/0D/1"], TensorProto.INT64, [1]);
+        self.make_unsqueeze("model/unsqueeze/-1", ["model/constants/TensorProto.INT64/0D/-1"], TensorProto.INT64, [1]);
+        self.make_unsqueeze("model/unsqueeze/0", ["model/constants/TensorProto.INT64/0D/0"], TensorProto.INT64, [1]);
+
+        slice_labels_inputs = [
+            "labels",
+            "model/unsqueeze/1/output_0",
+            "model/unsqueeze/-1/output_0",
+            "model/unsqueeze/1/output_0",
+            "model/unsqueeze/1/output_0",
+        ]
+        self.make_slice("model/slice_labels", slice_labels_inputs, TensorProto.INT64, ["unk", "unk"]);
+
+        self.make_reshape("model/reshape_sliced_labels", ["model/slice_labels/output_0", "model/constants/TensorProto.INT64/0D/-1"], TensorProto.INT64, ["unk"])
+
+        self.make_cast("model/cast_sliced_labels", "model/reshape_sliced_labels/output_0", TensorProto.INT64, ["unk"])
+        
+        slice_logits_inputs = [
+            "logits",
+            "model/unsqueeze/1/output_0",
+            "model/unsqueeze/-1/output_0",
+            "model/unsqueeze/0/output_0",
+            "model/unsqueeze/1/output_0",
+        ]
+        self.make_slice("model/slice_logits", slice_logits_inputs, TensorProto.INT64, ["unk", "unk", "unk"]);
+
+        self.make_reshape("model/reshape_sliced_logits", ["model/slice_logits/output_0", "model/constants/TensorProto.INT64/1D/[-1, 32064]"], TensorProto.INT64, ["unk", 32064])
+
+        softmaxcrossentropy_inputs = [
+            "model/reshape_sliced_logits/output_0",
+            "model/cast_sliced_labels/output_0"
+        ]
+
+        loss_output = "loss"
+        self.make_node("SoftmaxCrossEntropyLoss", inputs=softmaxcrossentropy_inputs, outputs=[loss_output], name=name)
+        self.make_value_info(loss_output, TensorProto.FLOAT, [1])
+
     def make_model(self, input_path):
         # Make inputs and outputs to ONNX model
         self.make_inputs_and_outputs()
@@ -1225,6 +1243,7 @@ class Model:
                     print("Reading LM head")
                     self.make_lm_head(module)
 
+        self.make_loss("model/softmax_crossentropy_loss")
         del model
 
     def has_final_norm(self, module, model):

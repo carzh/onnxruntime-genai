@@ -22,11 +22,11 @@ import textwrap
 
 class Model:
     def __init__(self, config, io_dtype, onnx_dtype, ep, cache_dir, extra_options):
+        self.num_kv_heads = config.num_key_value_heads if hasattr(config, "num_key_value_heads") else config.num_attention_heads
         self.context_length = config.max_position_embeddings
         self.window_size = config.sliding_window if hasattr(config, "sliding_window") else -1  # default is -1 in GroupQueryAttention kernel
         self.intermediate_size = config.intermediate_size
         self.hidden_size = config.hidden_size
-        self.num_kv_heads = config.num_key_value_heads if hasattr(config, "num_key_value_heads") else config.num_attention_heads
         self.num_attn_heads = config.num_attention_heads
         self.head_size = config.head_dim if hasattr(config, "head_dim") else config.hidden_size // config.num_attention_heads
         self.num_layers = int(extra_options["num_hidden_layers"]) if "num_hidden_layers" in extra_options else config.num_hidden_layers
@@ -67,6 +67,7 @@ class Model:
             "position_ids": TensorProto.INT64,                                                                   # For standard models
             "labels": TensorProto.INT64,
             "inputs_embeds": self.io_dtype,                                                                      # For standard models where you want to remove the embedding layer from the model (note that `inputs_embeds` is written this way to match Hugging Face format)
+            "past_key_values.key": self.io_dtype,                                                                # For standard models (note that `past_key_values.key` is written this way to match Hugging Face format)
         }
         self.input_shapes = {
             "input_ids": ["batch_size", "sequence_length"],                                                      # For standard models
@@ -74,6 +75,7 @@ class Model:
             "position_ids": ["batch_size", "sequence_length"],                                                   # For standard models
             "labels": ["batch_size", "sequence_length"],                                                   # For standard models
             "inputs_embeds": ["batch_size", "sequence_length", self.hidden_size],                                # For standard models where you want to remove the embedding layer from the model (note that `inputs_embeds` is written this way to match Hugging Face format)
+            "past_key_values.key": ["batch_size", self.num_kv_heads, "past_sequence_length", self.head_size],    # For standard models (note that `past_key_values.key` is written this way to match Hugging Face format)
         }
         self.exclude_embeds = "exclude_embeds" in extra_options
         if self.exclude_embeds:
@@ -89,7 +91,7 @@ class Model:
         self.output_shapes = {
             "hidden_states": ["batch_size", "sequence_length", self.hidden_size],                                # For standard models where you want to remove the language modeling head from the model (note that `hidden_states` is written this way to match Hugging Face format)
             "logits": ["batch_size", "sequence_length", self.vocab_size],                                        # For standard models
-            "loss": [1],
+            "loss": [],
         }
         self.exclude_lm_head = "exclude_lm_head" in extra_options
         if self.exclude_lm_head:
@@ -382,6 +384,8 @@ class Model:
             dtype = self.input_types[name]
             shape = self.input_shapes[name]
             inputs.append(helper.make_tensor_value_info(name, dtype, shape=shape))
+
+        inputs.append(helper.make_tensor_value_info("past_key_values.0.key", self.input_types["past_key_values.key"], shape=self.input_shapes["past_key_values.key"]))
 
         # Add model-specific outputs to list of model outputs
         outputs = []
@@ -752,12 +756,9 @@ class Model:
         transpose_1_name = f"{basename}/Transpose_1"
         transpose_1_input = f"{reshape_1_name}/output_0"
         self.make_transpose(transpose_1_name, transpose_1_input, dtype=self.io_dtype, shape=['batch_size', self.num_kv_heads, 'sequence_length', self.head_size], perm=[0,2,1,3])
-        concat_1_name = f"{basename}/Concat_1"
-        concat_1_inputs = [past_kv, f"{transpose_1_name}/output_0"]
-        self.make_node("Concat", inputs=concat_1_inputs, outputs=[present_kv], name=concat_1_name, axis=2)
 
         shape_1_name = f"{basename}/Shape_1"
-        self.make_shape(shape_1_name, present_kv, shape=[4])
+        self.make_shape(shape_1_name, f"{transpose_1_name}/output_0", shape=[4])
         gather_1_name = f"{basename}/Gather_1"
         gather_1_inputs = [f"{shape_1_name}/output_0", "/model/constants/TensorProto.INT64/0D/0"]
         self.make_gather(gather_1_name, gather_1_inputs, axis=0)
@@ -976,14 +977,7 @@ class Model:
             k_input_to_attention = f"{k_rotary_name}/output_0"
 
         # Make repeat KV nodes (TODO: remove once ORT supports GQA for CPU)
-        past_k = f"past_key_values.{layer_id}.key"
-        past_v = f"past_key_values.{layer_id}.value"
-        present_k = f"present.{layer_id}.key"
-        present_v = f"present.{layer_id}.value"
-        if self.num_attn_heads != self.num_kv_heads and self.attention_attrs["op_type"] == "MultiHeadAttention":
-            k_input_to_attention = self.make_repeat_kv(layer_id, root_input=k_input_to_attention, past_kv=past_k, present_kv=present_k)
-            v_input_to_attention = self.make_repeat_kv(layer_id, root_input=v_input_to_attention, past_kv=past_v, present_kv=present_v)
-            past_k, past_v, present_k, present_v = "", "", "", ""
+        past_k, past_v, present_k, present_v = "", "", "", ""
 
         # Make attention node (e.g. MultiHeadAttention, GroupQueryAttention, etc.)
         attn_name = f"/model/layers.{layer_id}/attn/{self.attention_attrs['op_type']}"
@@ -1151,42 +1145,33 @@ class Model:
             self.layernorm_attrs["last_layernorm"] = True
 
     def make_loss(self, name):
-        self.make_constant("model/constants/TensorProto.INT64/0D/1");
-        self.make_constant("model/constants/TensorProto.INT64/0D/-1");
-        self.make_constant("model/constants/TensorProto.INT64/0D/0");
-        self.make_constant("model/constants/TensorProto.INT64/1D/[-1, 32064]");
-
-        self.make_unsqueeze("model/unsqueeze/1", ["model/constants/TensorProto.INT64/0D/1"], TensorProto.INT64, [1]);
-        self.make_unsqueeze("model/unsqueeze/-1", ["model/constants/TensorProto.INT64/0D/-1"], TensorProto.INT64, [1]);
-        self.make_unsqueeze("model/unsqueeze/0", ["model/constants/TensorProto.INT64/0D/0"], TensorProto.INT64, [1]);
-
         slice_labels_inputs = [
             "labels",
-            "model/unsqueeze/1/output_0",
-            "model/unsqueeze/-1/output_0",
-            "model/unsqueeze/1/output_0",
-            "model/unsqueeze/1/output_0",
+            "/model/constants/TensorProto.INT64/1D/1",
+            "/model/constants/TensorProto.INT64/1D/-1",
+            "/model/constants/TensorProto.INT64/1D/1",
+            "/model/constants/TensorProto.INT64/1D/1",
         ]
-        self.make_slice("model/slice_labels", slice_labels_inputs, TensorProto.INT64, ["unk", "unk"]);
+        self.make_slice("/model/slice_labels", slice_labels_inputs, TensorProto.INT64, ["unk", "unk"]);
 
-        self.make_reshape("model/reshape_sliced_labels", ["model/slice_labels/output_0", "model/constants/TensorProto.INT64/0D/-1"], TensorProto.INT64, ["unk"])
+        self.make_reshape("/model/reshape_sliced_labels", ["/model/slice_labels/output_0", "/model/constants/TensorProto.INT64/0D/-1"], TensorProto.INT64, ["unk"])
 
-        self.make_cast("model/cast_sliced_labels", "model/reshape_sliced_labels/output_0", TensorProto.INT64, ["unk"])
+        self.make_cast("/model/cast_sliced_labels", "/model/reshape_sliced_labels/output_0", TensorProto.INT64, ["unk"])
         
         slice_logits_inputs = [
             "logits",
-            "model/unsqueeze/1/output_0",
-            "model/unsqueeze/-1/output_0",
-            "model/unsqueeze/0/output_0",
-            "model/unsqueeze/1/output_0",
+            "/model/constants/TensorProto.INT64/1D/1",
+            "/model/constants/TensorProto.INT64/1D/-1",
+            "/model/constants/TensorProto.INT64/1D/0",
+            "/model/constants/TensorProto.INT64/1D/1",
         ]
-        self.make_slice("model/slice_logits", slice_logits_inputs, TensorProto.INT64, ["unk", "unk", "unk"]);
+        self.make_slice("/model/slice_logits", slice_logits_inputs, TensorProto.INT64, ["unk", "unk", "unk"]);
 
-        self.make_reshape("model/reshape_sliced_logits", ["model/slice_logits/output_0", "model/constants/TensorProto.INT64/1D/[-1, 32064]"], TensorProto.INT64, ["unk", 32064])
+        self.make_reshape("/model/reshape_sliced_logits", ["/model/slice_logits/output_0", "/model/constants/TensorProto.INT64/1D/[-1, 32064]"], TensorProto.INT64, ["unk", 32064])
 
         softmaxcrossentropy_inputs = [
-            "model/reshape_sliced_logits/output_0",
-            "model/cast_sliced_labels/output_0"
+            "/model/reshape_sliced_logits/output_0",
+            "/model/cast_sliced_labels/output_0"
         ]
 
         loss_output = "loss"
@@ -1243,7 +1228,7 @@ class Model:
                     print("Reading LM head")
                     self.make_lm_head(module)
 
-        self.make_loss("model/softmax_crossentropy_loss")
+        self.make_loss("/model/softmax_crossentropy_loss")
         del model
 
     def has_final_norm(self, module, model):
@@ -1383,6 +1368,10 @@ class Model:
         #                 Add
         #                  |
         #              Unsqueeze
+        input_ids_gather_name = f"{basename}/Gather_2"
+        input_ids_gather_inputs = ["input_ids", "/model/constants/TensorProto.INT64/0D/1"]
+        self.make_gather(input_ids_gather_name, input_ids_gather_inputs, axis=0)
+        
         shared_add_name = f"{basename}/Add_1"
         shared_add_inputs = [f"{basename}/Gather_2/output_0", f"{past_key_gather_name}/output_0"]
         self.make_add(shared_add_name, shared_add_inputs, dtype=TensorProto.INT64, shape=[])

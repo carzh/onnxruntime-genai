@@ -1165,9 +1165,9 @@ class Model:
             "/model/constants/TensorProto.INT64/1D/0",
             "/model/constants/TensorProto.INT64/1D/1",
         ]
-        self.make_slice("/model/slice_logits", slice_logits_inputs, TensorProto.INT64, ["unk", "unk", "unk"]);
+        self.make_slice("/model/slice_logits", slice_logits_inputs, TensorProto.FLOAT, ["unk", "unk", "unk"]);
 
-        self.make_reshape("/model/reshape_sliced_logits", ["/model/slice_logits/output_0", "/model/constants/TensorProto.INT64/1D/[-1, 32064]"], TensorProto.INT64, ["unk", 32064])
+        self.make_reshape("/model/reshape_sliced_logits", ["/model/slice_logits/output_0", "/model/constants/TensorProto.INT64/1D/[-1, 32064]"], TensorProto.FLOAT, ["unk", 32064])
 
         softmaxcrossentropy_inputs = [
             "/model/reshape_sliced_logits/output_0",

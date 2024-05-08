@@ -67,7 +67,6 @@ class Model:
             "position_ids": TensorProto.INT64,                                                                   # For standard models
             "labels": TensorProto.INT64,
             "inputs_embeds": self.io_dtype,                                                                      # For standard models where you want to remove the embedding layer from the model (note that `inputs_embeds` is written this way to match Hugging Face format)
-            "past_key_values.key": self.io_dtype,                                                                # For standard models (note that `past_key_values.key` is written this way to match Hugging Face format)
         }
         self.input_shapes = {
             "input_ids": ["batch_size", "sequence_length"],                                                      # For standard models
@@ -75,7 +74,6 @@ class Model:
             "position_ids": ["batch_size", "sequence_length"],                                                   # For standard models
             "labels": ["batch_size", "sequence_length"],                                                   # For standard models
             "inputs_embeds": ["batch_size", "sequence_length", self.hidden_size],                                # For standard models where you want to remove the embedding layer from the model (note that `inputs_embeds` is written this way to match Hugging Face format)
-            "past_key_values.key": ["batch_size", self.num_kv_heads, "past_sequence_length", self.head_size],    # For standard models (note that `past_key_values.key` is written this way to match Hugging Face format)
         }
         self.exclude_embeds = "exclude_embeds" in extra_options
         if self.exclude_embeds:
@@ -132,7 +130,7 @@ class Model:
 
         # LayerNorm-specific variables
         self.layernorm_attrs = {
-            "simple": True,             # Use SimplifiedLayerNorm/SkipSimplifiedLayerNorm vs. LayerNorm/SkipLayerNorm
+            "simple": False,             # Use SimplifiedLayerNorm/SkipSimplifiedLayerNorm vs. LayerNorm/SkipLayerNorm
             "first_layernorm": True,    # 1st LayerNorm = LayerNorm, then SkipLayerNorm for all subsequent LayerNorms
             "last_layernorm": False,    # Last LayerNorm = SkipLayerNorm with only output 0 (no output 3)
             "root_input": "",           # Root input from parent node for LayerNorm and SkipLayerNorm
@@ -259,7 +257,7 @@ class Model:
 
         # Create ONNX model
         model = helper.make_model(
-            opset_imports=[self.clear_field(helper.make_operatorsetid('', 14), 'domain'), helper.make_operatorsetid('com.microsoft', 1)],
+            opset_imports=[self.clear_field(helper.make_operatorsetid('', 17), 'domain'), helper.make_operatorsetid('com.microsoft', 1)],
             ir_version=7,
             producer_name="onnxruntime-genai",
             producer_version="0.0.0",
@@ -384,8 +382,6 @@ class Model:
             dtype = self.input_types[name]
             shape = self.input_shapes[name]
             inputs.append(helper.make_tensor_value_info(name, dtype, shape=shape))
-
-        inputs.append(helper.make_tensor_value_info("past_key_values.0.key", self.input_types["past_key_values.key"], shape=self.input_shapes["past_key_values.key"]))
 
         # Add model-specific outputs to list of model outputs
         outputs = []
@@ -595,41 +591,49 @@ class Model:
     def make_layernorm(self, layer_id, layernorm, skip, simple, location):
         root_input = self.layernorm_attrs["root_input"]
         skip_input = self.layernorm_attrs["skip_input"]
+        input_from_add = f"/model/layers.{layer_id}/{location}_layernorm/add_for_skip/output_0"
+
+        if skip:
+            self.make_add(f"/model/layers.{layer_id}/{location}_layernorm/add_for_skip", [root_input, skip_input], self.io_dtype, ["batch_size", "sequence_length", self.hidden_size])
 
         weight = f"model.layers.{layer_id}.{location}_layernorm.weight"
         self.make_external_tensor(layernorm.weight.detach().numpy().astype(self.to_numpy_dtype[self.io_dtype]) + self.layernorm_attrs["add_offset"], weight)
         bias = f"model.layers.{layer_id}.{location}_layernorm.bias"
         if not simple:
-            self.make_external_tensor(layernorm.bias.detach().numpy().astype(self.to_numpy_dtype[self.io_dtype]), bias)
+            self.make_external_tensor(torch.zeros(self.hidden_size).detach().numpy().astype(self.to_numpy_dtype[self.io_dtype]), bias)
 
-        inputs = [root_input, skip_input, weight] if skip else [root_input, weight]
+        inputs = [input_from_add, weight] if skip else [root_input, weight]
         if not simple:
             inputs.append(bias)
 
-        name = f"/model/layers.{layer_id}/{location}_layernorm/{'Skip' if skip else ''}LayerNorm"
-        op_type = f"{'Skip' if skip else ''}{'Simplified' if simple else ''}LayerNormalization"
+        # name = f"/model/layers.{layer_id}/{location}_layernorm/{'Skip' if skip else ''}LayerNorm"
+        name = f"/model/layers.{layer_id}/{location}_layernorm/LayerNorm"
+        op_type = f"{'Simplified' if simple else ''}LayerNormalization"
+        # op_type = "LayerNormalization"
         kwargs = {"epsilon": 9.999999747378752e-06}
-        if not skip:
-            kwargs.update({"axis": -1, "stash_type": 1})
+        kwargs.update({"axis": -1, "stash_type": 1})
 
         output_0 = f"/model/layers.{layer_id}/{location}_layernorm/output_0"
-        output_3 = f"/model/layers.{layer_id}/{location}_layernorm/output_3"
         if self.layernorm_attrs["last_layernorm"] and self.exclude_lm_head:
             output_0 = "hidden_states"
-        outputs = [output_0, "", "", output_3] if skip and not self.layernorm_attrs["last_layernorm"] else [output_0]
+        output_1 = f"/model/layers.{layer_id}/{location}_layernorm/output_1"
+        output_2 = f"/model/layers.{layer_id}/{location}_layernorm/output_2"
+        outputs = [output_0, output_1, output_2]
 
-        self.make_node(op_type, inputs=inputs, outputs=outputs, name=name, domain=("com.microsoft" if skip else None), **kwargs)
+        self.make_node(op_type, inputs=inputs, outputs=outputs, name=name, domain=(None), **kwargs)
         self.make_value_info(output_0, self.io_dtype, shape=['batch_size', 'sequence_length', self.hidden_size])
-        if skip and not self.layernorm_attrs["last_layernorm"]:
-            self.make_value_info(output_3, self.io_dtype, shape=['batch_size', 'sequence_length', self.hidden_size])
+        self.make_value_info(output_1, self.io_dtype, shape=['batch_size', 'sequence_length', 1])
+        self.make_value_info(output_2, self.io_dtype, shape=['batch_size', 'sequence_length', 1])
+        # if skip and not self.layernorm_attrs["last_layernorm"]:
+        #     self.make_value_info(output_3, self.io_dtype, shape=['batch_size', 'sequence_length', self.hidden_size])
 
         # Update LayerNorm attributes
         self.layernorm_attrs["output_0"] = output_0
         if skip and not self.layernorm_attrs["last_layernorm"]:
-            self.layernorm_attrs["output_3"] = output_3
+            self.layernorm_attrs["output_3"] = input_from_add
 
             # Assign output 3 of current SkipLayerNorm as root input to next SkipLayerNorm
-            self.layernorm_attrs["root_input"] = output_3
+            self.layernorm_attrs["root_input"] = input_from_add
 
         return output_0
 
@@ -847,7 +851,8 @@ class Model:
         op_type = self.attention_attrs["op_type"]
 
         if op_type == "MultiHeadAttention":
-            self.make_multi_head_attention(name, add_qk=f"{self.mask_attrs['mask_name']}/output_0", **kwargs)
+            # self.make_multi_head_attention(name, add_qk=f"{self.mask_attrs['mask_name']}/output_0", **kwargs)
+            self.make_multi_head_attention(name, attn_mask="/model/cast_attention_mask_to_int32/output_0", **kwargs)
         elif op_type == "GroupQueryAttention":
             self.make_group_query_attention(name, seqlens_k=f"{self.mask_attrs['seqlens_k']}/output_0", total_seq_len=f"{self.mask_attrs['total_seq_len']}/output_0", **kwargs)
         else:
@@ -1182,6 +1187,8 @@ class Model:
         # Make inputs and outputs to ONNX model
         self.make_inputs_and_outputs()
 
+        self.make_cast("/model/cast_attention_mask_to_int32", "attention_mask", TensorProto.INT32, ["batch_size", "sequence_length"])
+
         # Make pre-processing nodes
         self.make_preprocessing_nodes()
 
@@ -1263,7 +1270,8 @@ class Model:
             #    attention mask reformatting subgraph
             #                   |
             #         4D causal attention mask
-            self.make_attention_mask_reformatting_for_mha()
+            # self.make_attention_mask_reformatting_for_mha()
+            pass
 
     def make_attention_mask_reformatting_for_mha(self):
         # Make nodes for the attention mask subgraphs that reformat the
@@ -1350,10 +1358,10 @@ class Model:
         self.mask_attrs["mask_name"] = concat_name
 
     def make_past_key_subgraph(self, basename):
-        shape_name = f"{basename}/Shape"
-        self.make_shape(shape_name, "past_key_values.0.key", shape=[4])
+        # shape_name = f"{basename}/Shape"
+        # self.make_shape(shape_name, "past_key_values.0.key", shape=[4])
         gather_name = f"{basename}/Gather"
-        gather_inputs = [f"{shape_name}/output_0", "/model/constants/TensorProto.INT64/0D/2"]
+        gather_inputs = [f"model/constants/TensorProto.INT64/1D/[\"batch_size\", {self.num_kv_heads}, \"past_sequence_length\", 96]", "/model/constants/TensorProto.INT64/0D/2"]
         self.make_gather(gather_name, gather_inputs, axis=0)
         return gather_name
 

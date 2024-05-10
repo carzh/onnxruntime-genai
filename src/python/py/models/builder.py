@@ -80,7 +80,7 @@ class Model:
             self.input_names = [name.replace("input_ids", "inputs_embeds") for name in self.input_names]
 
         # Map output names to their types and shapes
-        self.output_names = ["logits", "loss"]
+        self.output_names = ["loss", "logits"]
         self.output_types = {
             "hidden_states": self.io_dtype,                                                                      # For standard models where you want to remove the language modeling head from the model (note that `hidden_states` is written this way to match Hugging Face format)
             "logits": self.io_dtype,                                                                             # For standard models

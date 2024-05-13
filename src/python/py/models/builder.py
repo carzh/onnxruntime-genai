@@ -1153,26 +1153,26 @@ class Model:
         slice_labels_inputs = [
             "labels",
             "/model/constants/TensorProto.INT64/1D/1",
-            "/model/constants/TensorProto.INT64/1D/-1",
+            f"/model/constants/TensorProto.INT64/1D/{np.iinfo(np.int64).max}",
             "/model/constants/TensorProto.INT64/1D/1",
             "/model/constants/TensorProto.INT64/1D/1",
         ]
         self.make_slice("/model/slice_labels", slice_labels_inputs, TensorProto.INT64, ["unk", "unk"]);
 
-        self.make_reshape("/model/reshape_sliced_labels", ["/model/slice_labels/output_0", "/model/constants/TensorProto.INT64/0D/-1"], TensorProto.INT64, ["unk"])
+        self.make_reshape("/model/reshape_sliced_labels", ["/model/slice_labels/output_0", "/model/constants/TensorProto.INT64/1D/-1"], TensorProto.INT64, ["batch_size"])
 
-        self.make_cast("/model/cast_sliced_labels", "/model/reshape_sliced_labels/output_0", TensorProto.INT64, ["unk"])
+        self.make_cast("/model/cast_sliced_labels", "/model/reshape_sliced_labels/output_0", TensorProto.INT64, ["batch_size"])
         
         slice_logits_inputs = [
             "logits",
-            "/model/constants/TensorProto.INT64/1D/1",
-            "/model/constants/TensorProto.INT64/1D/-1",
             "/model/constants/TensorProto.INT64/1D/0",
+            "/model/constants/TensorProto.INT64/1D/-1",
+            "/model/constants/TensorProto.INT64/1D/1",
             "/model/constants/TensorProto.INT64/1D/1",
         ]
         self.make_slice("/model/slice_logits", slice_logits_inputs, TensorProto.FLOAT, ["unk", "unk", "unk"]);
 
-        self.make_reshape("/model/reshape_sliced_logits", ["/model/slice_logits/output_0", "/model/constants/TensorProto.INT64/1D/[-1, 32064]"], TensorProto.FLOAT, ["unk", 32064])
+        self.make_reshape("/model/reshape_sliced_logits", ["/model/slice_logits/output_0", "/model/constants/TensorProto.INT64/1D/-1, 32064"], TensorProto.FLOAT, ["batch_size", 32064])
 
         softmaxcrossentropy_inputs = [
             "/model/reshape_sliced_logits/output_0",
@@ -1356,14 +1356,6 @@ class Model:
         self.make_concat(concat_name, concat_inputs, dtype=self.io_dtype, shape=concat_shape, axis=1) # Shape of mask is now (B, N, S, T)
 
         self.mask_attrs["mask_name"] = concat_name
-
-    def make_past_key_subgraph(self, basename):
-        # shape_name = f"{basename}/Shape"
-        # self.make_shape(shape_name, "past_key_values.0.key", shape=[4])
-        gather_name = f"{basename}/Gather"
-        gather_inputs = [f"model/constants/TensorProto.INT64/1D/[\"batch_size\", {self.num_kv_heads}, \"past_sequence_length\", 96]", "/model/constants/TensorProto.INT64/0D/2"]
-        self.make_gather(gather_name, gather_inputs, axis=0)
-        return gather_name
 
     def make_input_ids_subgraph(self, basename, past_key_gather_name):
         # Make shared nodes between past_key_values.0.key (Gather with idx=2) and input_ids (Gather with idx=1) subgraphs

@@ -1368,7 +1368,7 @@ class Model:
         #              Unsqueeze
         
         shared_add_name = f"{basename}/Add_1"
-        shared_add_inputs = [f"{basename}/Gather_2/output_0", "/model/constants/TensorProto.INT64/1D/0"]
+        shared_add_inputs = [f"{basename}/Gather_2/output_0", "/model/constants/TensorProto.INT64/0D/0"]
         self.make_add(shared_add_name, shared_add_inputs, dtype=TensorProto.INT64, shape=[])
         unsqueeze_3_name = f"{basename}/Unsqueeze_3"  # shared unsqueeze for input_ids and past_key_values.0.key
         unsqueeze_3_inputs = [f"{shared_add_name}/output_0", "/model/constants/TensorProto.INT64/1D/0"]

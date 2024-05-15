@@ -60,19 +60,20 @@ class Model:
         }
 
         # Map input names to their types and shapes
-        self.input_names = ["input_ids", "attention_mask", "position_ids", "labels"]
+        # self.input_names = ["input_ids", "attention_mask", "position_ids", "labels"]
+        self.input_names = ["input_ids", "attention_mask", "position_ids"]
         self.input_types = {
             "input_ids": TensorProto.INT64,                                                                      # For standard models
             "attention_mask": TensorProto.INT64,                                                                 # For standard models
             "position_ids": TensorProto.INT64,                                                                   # For standard models
-            "labels": TensorProto.INT64,
+            # "labels": TensorProto.INT64,
             "inputs_embeds": self.io_dtype,                                                                      # For standard models where you want to remove the embedding layer from the model (note that `inputs_embeds` is written this way to match Hugging Face format)
         }
         self.input_shapes = {
             "input_ids": ["batch_size", "sequence_length"],                                                      # For standard models
             "attention_mask": ["batch_size", "total_sequence_length"],                                           # For standard models
             "position_ids": ["batch_size", "sequence_length"],                                                   # For standard models
-            "labels": ["batch_size", "sequence_length"],                                                   # For standard models
+            # "labels": ["batch_size", "sequence_length"],                                                   # For standard models
             "inputs_embeds": ["batch_size", "sequence_length", self.hidden_size],                                # For standard models where you want to remove the embedding layer from the model (note that `inputs_embeds` is written this way to match Hugging Face format)
         }
         self.exclude_embeds = "exclude_embeds" in extra_options
@@ -80,16 +81,17 @@ class Model:
             self.input_names = [name.replace("input_ids", "inputs_embeds") for name in self.input_names]
 
         # Map output names to their types and shapes
-        self.output_names = ["loss", "logits"]
+        # self.output_names = ["loss", "logits"]
+        self.output_names = ["logits"]
         self.output_types = {
             "hidden_states": self.io_dtype,                                                                      # For standard models where you want to remove the language modeling head from the model (note that `hidden_states` is written this way to match Hugging Face format)
             "logits": self.io_dtype,                                                                             # For standard models
-            "loss": TensorProto.FLOAT,                                                                          # For standard models
+            # "loss": TensorProto.FLOAT,                                                                          # For standard models
         }
         self.output_shapes = {
             "hidden_states": ["batch_size", "sequence_length", self.hidden_size],                                # For standard models where you want to remove the language modeling head from the model (note that `hidden_states` is written this way to match Hugging Face format)
             "logits": ["batch_size", "sequence_length", self.vocab_size],                                        # For standard models
-            "loss": [],
+            # "loss": [],
         }
         self.exclude_lm_head = "exclude_lm_head" in extra_options
         if self.exclude_lm_head:
@@ -1159,9 +1161,9 @@ class Model:
         ]
         self.make_slice("/model/slice_labels", slice_labels_inputs, TensorProto.INT64, ["unk", "unk"]);
 
-        self.make_reshape("/model/reshape_sliced_labels", ["/model/slice_labels/output_0", "/model/constants/TensorProto.INT64/1D/-1"], TensorProto.INT64, ["batch_size"])
+        self.make_reshape("/model/reshape_sliced_labels", ["/model/slice_labels/output_0", "/model/constants/TensorProto.INT64/1D/-1"], TensorProto.INT64, ["unk"])
 
-        self.make_cast("/model/cast_sliced_labels", "/model/reshape_sliced_labels/output_0", TensorProto.INT64, ["batch_size"])
+        self.make_cast("/model/cast_sliced_labels", "/model/reshape_sliced_labels/output_0", TensorProto.INT64, ["unk"])
         
         slice_logits_inputs = [
             "logits",
@@ -1172,7 +1174,7 @@ class Model:
         ]
         self.make_slice("/model/slice_logits", slice_logits_inputs, TensorProto.FLOAT, ["unk", "unk", "unk"]);
 
-        self.make_reshape("/model/reshape_sliced_logits", ["/model/slice_logits/output_0", "/model/constants/TensorProto.INT64/1D/-1, 32064"], TensorProto.FLOAT, ["batch_size", 32064])
+        self.make_reshape("/model/reshape_sliced_logits", ["/model/slice_logits/output_0", "/model/constants/TensorProto.INT64/1D/-1, 32064"], TensorProto.FLOAT, ["unk", 32064])
 
         softmaxcrossentropy_inputs = [
             "/model/reshape_sliced_logits/output_0",
@@ -1235,7 +1237,7 @@ class Model:
                     print("Reading LM head")
                     self.make_lm_head(module)
 
-        self.make_loss("/model/softmax_crossentropy_loss")
+        # self.make_loss("/model/softmax_crossentropy_loss")
         del model
 
     def has_final_norm(self, module, model):

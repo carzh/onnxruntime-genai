@@ -60,20 +60,19 @@ class Model:
         }
 
         # Map input names to their types and shapes
-        # self.input_names = ["input_ids", "attention_mask", "position_ids", "labels"]
-        self.input_names = ["input_ids", "attention_mask", "position_ids"]
+        self.input_names = ["input_ids", "attention_mask", "position_ids", "labels"]
         self.input_types = {
             "input_ids": TensorProto.INT64,                                                                      # For standard models
             "attention_mask": TensorProto.INT64,                                                                 # For standard models
             "position_ids": TensorProto.INT64,                                                                   # For standard models
-            # "labels": TensorProto.INT64,
+            "labels": TensorProto.INT64,
             "inputs_embeds": self.io_dtype,                                                                      # For standard models where you want to remove the embedding layer from the model (note that `inputs_embeds` is written this way to match Hugging Face format)
         }
         self.input_shapes = {
             "input_ids": ["batch_size", "sequence_length"],                                                      # For standard models
             "attention_mask": ["batch_size", "total_sequence_length"],                                           # For standard models
             "position_ids": ["batch_size", "sequence_length"],                                                   # For standard models
-            # "labels": ["batch_size", "sequence_length"],                                                   # For standard models
+            "labels": ["batch_size", "sequence_length"],                                                   # For standard models
             "inputs_embeds": ["batch_size", "sequence_length", self.hidden_size],                                # For standard models where you want to remove the embedding layer from the model (note that `inputs_embeds` is written this way to match Hugging Face format)
         }
         self.exclude_embeds = "exclude_embeds" in extra_options
@@ -81,17 +80,17 @@ class Model:
             self.input_names = [name.replace("input_ids", "inputs_embeds") for name in self.input_names]
 
         # Map output names to their types and shapes
-        # self.output_names = ["loss", "logits"]
+        self.output_names = ["loss", "logits"]
         self.output_names = ["logits"]
         self.output_types = {
             "hidden_states": self.io_dtype,                                                                      # For standard models where you want to remove the language modeling head from the model (note that `hidden_states` is written this way to match Hugging Face format)
             "logits": self.io_dtype,                                                                             # For standard models
-            # "loss": TensorProto.FLOAT,                                                                          # For standard models
+            "loss": TensorProto.FLOAT,                                                                          # For standard models
         }
         self.output_shapes = {
             "hidden_states": ["batch_size", "sequence_length", self.hidden_size],                                # For standard models where you want to remove the language modeling head from the model (note that `hidden_states` is written this way to match Hugging Face format)
             "logits": ["batch_size", "sequence_length", self.vocab_size],                                        # For standard models
-            # "loss": [],
+            "loss": [],
         }
         self.exclude_lm_head = "exclude_lm_head" in extra_options
         if self.exclude_lm_head:
@@ -853,8 +852,8 @@ class Model:
         op_type = self.attention_attrs["op_type"]
 
         if op_type == "MultiHeadAttention":
-            # self.make_multi_head_attention(name, add_qk=f"{self.mask_attrs['mask_name']}/output_0", **kwargs)
-            self.make_multi_head_attention(name, attn_mask="/model/cast_attention_mask_to_int32/output_0", **kwargs)
+            self.make_multi_head_attention(name, add_qk=f"{self.mask_attrs['mask_name']}/output_0", **kwargs)
+            # self.make_multi_head_attention(name, attn_mask="/model/cast_attention_mask_to_int32/output_0", **kwargs)
         elif op_type == "GroupQueryAttention":
             self.make_group_query_attention(name, seqlens_k=f"{self.mask_attrs['seqlens_k']}/output_0", total_seq_len=f"{self.mask_attrs['total_seq_len']}/output_0", **kwargs)
         else:
@@ -1189,7 +1188,7 @@ class Model:
         # Make inputs and outputs to ONNX model
         self.make_inputs_and_outputs()
 
-        self.make_cast("/model/cast_attention_mask_to_int32", "attention_mask", TensorProto.INT32, ["batch_size", "sequence_length"])
+        # self.make_cast("/model/cast_attention_mask_to_int32", "attention_mask", TensorProto.INT32, ["batch_size", "sequence_length"])
 
         # Make pre-processing nodes
         self.make_preprocessing_nodes()
@@ -1237,7 +1236,7 @@ class Model:
                     print("Reading LM head")
                     self.make_lm_head(module)
 
-        # self.make_loss("/model/softmax_crossentropy_loss")
+        self.make_loss("/model/softmax_crossentropy_loss")
         del model
 
     def has_final_norm(self, module, model):
@@ -1272,8 +1271,7 @@ class Model:
             #    attention mask reformatting subgraph
             #                   |
             #         4D causal attention mask
-            # self.make_attention_mask_reformatting_for_mha()
-            pass
+            self.make_attention_mask_reformatting_for_mha()
 
     def make_attention_mask_reformatting_for_mha(self):
         # Make nodes for the attention mask subgraphs that reformat the
@@ -1340,10 +1338,10 @@ class Model:
         attn_mask_basename = f"{basename}/attn_mask_subgraph"
 
         # Make past_key_values.0.key subgraph
-        past_key_gather_name = self.make_past_key_subgraph(past_key_basename)
+        # past_key_gather_name = self.make_past_key_subgraph(past_key_basename)
 
         # Make common attention mask subgraphs, one each for input_ids and attention_mask
-        shared_unsqueeze_name, end_expand_name = self.make_input_ids_subgraph(input_ids_basename, past_key_gather_name)
+        shared_unsqueeze_name, end_expand_name = self.make_input_ids_subgraph(input_ids_basename)
         end_where_name = self.make_attention_mask_subgraph(attn_mask_basename, shared_unsqueeze_name)
 
         end_add_name = f"{basename}/Add"
@@ -1359,7 +1357,7 @@ class Model:
 
         self.mask_attrs["mask_name"] = concat_name
 
-    def make_input_ids_subgraph(self, basename, past_key_gather_name):
+    def make_input_ids_subgraph(self, basename):
         # Make shared nodes between past_key_values.0.key (Gather with idx=2) and input_ids (Gather with idx=1) subgraphs
         #
         #       Gather          Gather
@@ -1367,18 +1365,16 @@ class Model:
         #              \       /
         #               \     /
         #                \   /
-        #                 Add
-        #                  |
         #              Unsqueeze
-        input_ids_gather_name = f"{basename}/Gather_2"
-        input_ids_gather_inputs = ["input_ids", "/model/constants/TensorProto.INT64/0D/1"]
-        self.make_gather(input_ids_gather_name, input_ids_gather_inputs, axis=0)
+        # input_ids_gather_name = f"{basename}/Gather_2"
+        # input_ids_gather_inputs = ["input_ids", "/model/constants/TensorProto.INT64/0D/1"]
+        # self.make_gather(input_ids_gather_name, input_ids_gather_inputs, axis=0)
         
-        shared_add_name = f"{basename}/Add_1"
-        shared_add_inputs = [f"{basename}/Gather_2/output_0", f"{past_key_gather_name}/output_0"]
-        self.make_add(shared_add_name, shared_add_inputs, dtype=TensorProto.INT64, shape=[])
+        # shared_add_name = f"{basename}/Add_1"
+        # shared_add_inputs = [f"{basename}/Gather_2/output_0", f"{past_key_gather_name}/output_0"]
+        # self.make_add(shared_add_name, shared_add_inputs, dtype=TensorProto.INT64, shape=[])
         unsqueeze_3_name = f"{basename}/Unsqueeze_3"  # shared unsqueeze for input_ids and past_key_values.0.key
-        unsqueeze_3_inputs = [f"{shared_add_name}/output_0", "/model/constants/TensorProto.INT64/1D/0"]
+        unsqueeze_3_inputs = [f"{basename}/Gather_2/output_0", "/model/constants/TensorProto.INT64/1D/0"]
         self.make_unsqueeze(unsqueeze_3_name, unsqueeze_3_inputs, dtype=TensorProto.INT64, shape=[1])
 
         # Make the additional subgraph for input_ids

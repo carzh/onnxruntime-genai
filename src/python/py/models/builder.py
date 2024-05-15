@@ -1277,15 +1277,15 @@ class Model:
         # Make nodes for the attention mask subgraphs that reformat the
         # 2D attention mask (B, S) to 4D causal attention mask (B, N, S, T)
         #
-        #             input_ids       past_key_values.0.key
-        #            /         \               |
-        #         Shape       Shape          Shape
-        #          |            |              |
-        #        Gather       Gather         Gather
-        #       (idx=0)       (idx=1)        (idx=2)
-        #          |            |    |\      /
-        #          |            |    | \    /
-        #          |            |    |   Add                                      attention_mask--------+
+        #             input_ids     
+        #            /         \    
+        #         Shape       Shape 
+        #          |            |   
+        #        Gather       Gather
+        #       (idx=0)       (idx=1)
+        #          |            |    |\ 
+        #          |            |    | \ 
+        #          |            |    |   \
         #          |            |    |    |                                       /           \         |
         #      Unsqueeze   Unsqueeze | Unsqueeze                                Shape       Shape       |
         #              \        |    |  /                                         |           |         |
@@ -1366,13 +1366,10 @@ class Model:
         #               \     /
         #                \   /
         #              Unsqueeze
-        # input_ids_gather_name = f"{basename}/Gather_2"
-        # input_ids_gather_inputs = ["input_ids", "/model/constants/TensorProto.INT64/0D/1"]
-        # self.make_gather(input_ids_gather_name, input_ids_gather_inputs, axis=0)
         
-        # shared_add_name = f"{basename}/Add_1"
-        # shared_add_inputs = [f"{basename}/Gather_2/output_0", f"{past_key_gather_name}/output_0"]
-        # self.make_add(shared_add_name, shared_add_inputs, dtype=TensorProto.INT64, shape=[])
+        shared_add_name = f"{basename}/Add_1"
+        shared_add_inputs = [f"{basename}/Gather_2/output_0", "/model/constants/TensorProto.INT64/1D/0"]
+        self.make_add(shared_add_name, shared_add_inputs, dtype=TensorProto.INT64, shape=[])
         unsqueeze_3_name = f"{basename}/Unsqueeze_3"  # shared unsqueeze for input_ids and past_key_values.0.key
         unsqueeze_3_inputs = [f"{basename}/Gather_2/output_0", "/model/constants/TensorProto.INT64/1D/0"]
         self.make_unsqueeze(unsqueeze_3_name, unsqueeze_3_inputs, dtype=TensorProto.INT64, shape=[1])

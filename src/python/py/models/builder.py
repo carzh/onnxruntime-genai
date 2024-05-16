@@ -22,7 +22,6 @@ import textwrap
 
 class Model:
     def __init__(self, config, io_dtype, onnx_dtype, ep, cache_dir, extra_options):
-        self.num_constants = 0
         self.num_kv_heads = config.num_key_value_heads if hasattr(config, "num_key_value_heads") else config.num_attention_heads
         self.context_length = config.max_position_embeddings
         self.window_size = config.sliding_window if hasattr(config, "sliding_window") else -1  # default is -1 in GroupQueryAttention kernel
@@ -82,7 +81,6 @@ class Model:
 
         # Map output names to their types and shapes
         self.output_names = ["loss", "logits"]
-        self.output_names = ["logits"]
         self.output_types = {
             "hidden_states": self.io_dtype,                                                                      # For standard models where you want to remove the language modeling head from the model (note that `hidden_states` is written this way to match Hugging Face format)
             "logits": self.io_dtype,                                                                             # For standard models
@@ -401,12 +399,13 @@ class Model:
         path = name.split("/")
         onnx_dtype, dims, num = eval(path[-3]), path[-2], eval(path[-1])
         np_dtype = self.to_numpy_dtype[onnx_dtype]
-        value = numpy_helper.from_array(np.array(num if dims == "0D" else list(num) if type(num) == tuple else [num], dtype=np_dtype), name=name.replace("constants", "numpy_helper"))
+        np_value = np.array(num if dims == "0D" else list(num) if type(num) == tuple else [num], dtype=np_dtype)
+        shape = [] if dims == "0D" else np_value.shape
+        value = numpy_helper.from_array(np_value, name=name.replace("constants", "numpy_helper"))
 
-        node_name = name.replace("constants", "constant_nodes" + self.num_constants)
-        self.num_constants += 1
+        node_name = name.replace("constants", "constant_nodes")
         self.make_node("Constant", inputs=[], outputs=[name], name=node_name, value=value)
-        self.make_value_info(name, onnx_dtype, shape=[])
+        self.make_value_info(name, onnx_dtype, shape=shape)
         self.node_names.add(name)
 
     def make_gather(self, name, inputs, axis):

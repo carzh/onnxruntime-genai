@@ -60,11 +60,12 @@ class Model:
         }
 
         # Map input names to their types and shapes
-        self.input_names = ["input_ids", "attention_mask", "position_ids"]
+        self.input_names = ["input_ids", "attention_mask", "position_ids", "labels"]
         self.input_types = {
             "input_ids": TensorProto.INT64,                                                                      # For standard models
             "attention_mask": TensorProto.INT64,                                                                 # For standard models
             "position_ids": TensorProto.INT64,                                                                   # For standard models
+            "labels": TensorProto.INT64,                                                                         # For standard models
             "inputs_embeds": self.io_dtype,                                                                      # For standard models where you want to remove the embedding layer from the model (note that `inputs_embeds` is written this way to match Hugging Face format)
             "past_key_values.key": self.io_dtype,                                                                # For standard models (note that `past_key_values.key` is written this way to match Hugging Face format)
             "past_key_values.value": self.io_dtype,                                                              # For standard models (note that `past_key_values.value` is written this way to match Hugging Face format)
@@ -73,6 +74,7 @@ class Model:
             "input_ids": ["batch_size", "sequence_length"],                                                      # For standard models
             "attention_mask": ["batch_size", "total_sequence_length"],                                           # For standard models
             "position_ids": ["batch_size", "sequence_length"],                                                   # For standard models
+            "labels": ["batch_size", "sequence_length"],                                                      # For standard models
             "inputs_embeds": ["batch_size", "sequence_length", self.hidden_size],                                # For standard models where you want to remove the embedding layer from the model (note that `inputs_embeds` is written this way to match Hugging Face format)
             "past_key_values.key": ["batch_size", self.num_kv_heads, "past_sequence_length", self.head_size],    # For standard models (note that `past_key_values.key` is written this way to match Hugging Face format)
             "past_key_values.value": ["batch_size", self.num_kv_heads, "past_sequence_length", self.head_size],  # For standard models (note that `past_key_values.value` is written this way to match Hugging Face format)
@@ -82,16 +84,18 @@ class Model:
             self.input_names = [name.replace("input_ids", "inputs_embeds") for name in self.input_names]
 
         # Map output names to their types and shapes
-        self.output_names = ["logits"]
+        self.output_names = ["loss", "logits"]
         self.output_types = {
             "hidden_states": self.io_dtype,                                                                      # For standard models where you want to remove the language modeling head from the model (note that `hidden_states` is written this way to match Hugging Face format)
             "logits": self.io_dtype,                                                                             # For standard models
+            "loss": TensorProto.FLOAT,
             "present.key": self.io_dtype,                                                                        # For standard models (note that `present.key` is written this way to match Hugging Face format)
             "present.value": self.io_dtype,                                                                      # For standard models (note that `present.value` is written this way to match Hugging Face format)
         }
         self.output_shapes = {
             "hidden_states": ["batch_size", "sequence_length", self.hidden_size],                                # For standard models where you want to remove the language modeling head from the model (note that `hidden_states` is written this way to match Hugging Face format)
             "logits": ["batch_size", "sequence_length", self.vocab_size],                                        # For standard models
+            "loss": [],
             "present.key": ["batch_size", self.num_kv_heads, "total_sequence_length", self.head_size],           # For standard models (note that `present.key` is written this way to match Hugging Face format)
             "present.value": ["batch_size", self.num_kv_heads, "total_sequence_length", self.head_size],         # For standard models (note that `present.value` is written this way to match Hugging Face format)
         }
@@ -134,7 +138,7 @@ class Model:
 
         # LayerNorm-specific variables
         self.layernorm_attrs = {
-            "simple": True,             # Use SimplifiedLayerNorm/SkipSimplifiedLayerNorm vs. LayerNorm/SkipLayerNorm
+            "simple": False,             # Use SimplifiedLayerNorm/SkipSimplifiedLayerNorm vs. LayerNorm/SkipLayerNorm
             "first_layernorm": True,    # 1st LayerNorm = LayerNorm, then SkipLayerNorm for all subsequent LayerNorms
             "last_layernorm": False,    # Last LayerNorm = SkipLayerNorm with only output 0 (no output 3)
             "root_input": "",           # Root input from parent node for LayerNorm and SkipLayerNorm
@@ -268,7 +272,7 @@ class Model:
 
         # Create ONNX model
         model = helper.make_model(
-            opset_imports=[self.clear_field(helper.make_operatorsetid('', 14), 'domain'), helper.make_operatorsetid('com.microsoft', 1)],
+            opset_imports=[self.clear_field(helper.make_operatorsetid('', 17), 'domain'), helper.make_operatorsetid('com.microsoft', 1)],
             ir_version=7,
             producer_name="onnxruntime-genai",
             producer_version="0.0.0",
@@ -424,11 +428,13 @@ class Model:
         path = name.split("/")
         onnx_dtype, dims, num = eval(path[-3]), path[-2], eval(path[-1])
         np_dtype = self.to_numpy_dtype[onnx_dtype]
-        value = numpy_helper.from_array(np.array(num if dims == "0D" else list(num) if type(num) == tuple else [num], dtype=np_dtype), name=name.replace("constants", "numpy_helper"))
+        np_value = np.array(num if dims == "0D" else list(num) if type(num) == tuple else [num], dtype=np_dtype)
+        shape = [] if dims == "0D" else np_value.shape
+        value = numpy_helper.from_array(np_value, name=name.replace("constants", "numpy_helper"))
 
         node_name = name.replace("constants", "constant_nodes")
         self.make_node("Constant", inputs=[], outputs=[name], name=node_name, value=value)
-        self.make_value_info(name, onnx_dtype, shape=[])
+        self.make_value_info(name, onnx_dtype, shape=shape)
         self.node_names.add(name)
 
     def make_gather(self, name, inputs, axis):
@@ -616,41 +622,49 @@ class Model:
     def make_layernorm(self, layer_id, layernorm, skip, simple, location):
         root_input = self.layernorm_attrs["root_input"]
         skip_input = self.layernorm_attrs["skip_input"]
+        input_from_add = f"/model/layers.{layer_id}/{location}_layernorm/add_for_skip/output_0"
+
+        if skip:
+            self.make_add(f"/model/layers.{layer_id}/{location}_layernorm/add_for_skip", [root_input, skip_input], self.io_dtype, ["batch_size", "sequence_length", self.hidden_size])
 
         weight = f"model.layers.{layer_id}.{location}_layernorm.weight"
         self.make_external_tensor(layernorm.weight.detach().numpy().astype(self.to_numpy_dtype[self.io_dtype]) + self.layernorm_attrs["add_offset"], weight)
         bias = f"model.layers.{layer_id}.{location}_layernorm.bias"
         if not simple:
-            self.make_external_tensor(layernorm.bias.detach().numpy().astype(self.to_numpy_dtype[self.io_dtype]), bias)
+            self.make_external_tensor(torch.zeros(self.hidden_size).detach().numpy().astype(self.to_numpy_dtype[self.io_dtype]), bias)
 
-        inputs = [root_input, skip_input, weight] if skip else [root_input, weight]
+        inputs = [input_from_add, weight] if skip else [root_input, weight]
         if not simple:
             inputs.append(bias)
 
-        name = f"/model/layers.{layer_id}/{location}_layernorm/{'Skip' if skip else ''}LayerNorm"
-        op_type = f"{'Skip' if skip else ''}{'Simplified' if simple else ''}LayerNormalization"
+        # name = f"/model/layers.{layer_id}/{location}_layernorm/{'Skip' if skip else ''}LayerNorm"
+        name = f"/model/layers.{layer_id}/{location}_layernorm/LayerNorm"
+        op_type = f"{'Simplified' if simple else ''}LayerNormalization"
+        # op_type = "LayerNormalization"
         kwargs = {"epsilon": 9.999999747378752e-06}
-        if not skip:
-            kwargs.update({"axis": -1, "stash_type": 1})
+        kwargs.update({"axis": -1, "stash_type": 1})
 
         output_0 = f"/model/layers.{layer_id}/{location}_layernorm/output_0"
-        output_3 = f"/model/layers.{layer_id}/{location}_layernorm/output_3"
         if self.layernorm_attrs["last_layernorm"] and self.exclude_lm_head:
             output_0 = "hidden_states"
-        outputs = [output_0, "", "", output_3] if skip and not self.layernorm_attrs["last_layernorm"] else [output_0]
+        output_1 = f"/model/layers.{layer_id}/{location}_layernorm/output_1"
+        output_2 = f"/model/layers.{layer_id}/{location}_layernorm/output_2"
+        outputs = [output_0, output_1, output_2]
 
-        self.make_node(op_type, inputs=inputs, outputs=outputs, name=name, domain=("com.microsoft" if skip else None), **kwargs)
+        self.make_node(op_type, inputs=inputs, outputs=outputs, name=name, domain=(None), **kwargs)
         self.make_value_info(output_0, self.io_dtype, shape=['batch_size', 'sequence_length', self.hidden_size])
-        if skip and not self.layernorm_attrs["last_layernorm"]:
-            self.make_value_info(output_3, self.io_dtype, shape=['batch_size', 'sequence_length', self.hidden_size])
+        self.make_value_info(output_1, self.io_dtype, shape=['batch_size', 'sequence_length', 1])
+        self.make_value_info(output_2, self.io_dtype, shape=['batch_size', 'sequence_length', 1])
+        # if skip and not self.layernorm_attrs["last_layernorm"]:
+        #     self.make_value_info(output_3, self.io_dtype, shape=['batch_size', 'sequence_length', self.hidden_size])
 
         # Update LayerNorm attributes
         self.layernorm_attrs["output_0"] = output_0
         if skip and not self.layernorm_attrs["last_layernorm"]:
-            self.layernorm_attrs["output_3"] = output_3
+            self.layernorm_attrs["output_3"] = input_from_add
 
             # Assign output 3 of current SkipLayerNorm as root input to next SkipLayerNorm
-            self.layernorm_attrs["root_input"] = output_3
+            self.layernorm_attrs["root_input"] = input_from_add
 
         return output_0
 
@@ -1175,6 +1189,40 @@ class Model:
             # Norm after last decoder layer of model (last layer --> norm)
             self.layernorm_attrs["last_layernorm"] = True
 
+    def make_loss(self, name):
+        slice_labels_inputs = [
+            "labels",
+            "/model/constants/TensorProto.INT64/1D/1",
+            f"/model/constants/TensorProto.INT64/1D/{np.iinfo(np.int64).max}",
+            "/model/constants/TensorProto.INT64/1D/1",
+            "/model/constants/TensorProto.INT64/1D/1",
+        ]
+        self.make_slice("/model/slice_labels", slice_labels_inputs, TensorProto.INT64, ["unk", "unk"]);
+
+        self.make_reshape("/model/reshape_sliced_labels", ["/model/slice_labels/output_0", "/model/constants/TensorProto.INT64/1D/-1"], TensorProto.INT64, ["unk"])
+
+        self.make_cast("/model/cast_sliced_labels", "/model/reshape_sliced_labels/output_0", TensorProto.INT64, ["unk"])
+        
+        slice_logits_inputs = [
+            "logits",
+            "/model/constants/TensorProto.INT64/1D/0",
+            "/model/constants/TensorProto.INT64/1D/-1",
+            "/model/constants/TensorProto.INT64/1D/1",
+            "/model/constants/TensorProto.INT64/1D/1",
+        ]
+        self.make_slice("/model/slice_logits", slice_logits_inputs, TensorProto.FLOAT, ["unk", "unk", "unk"]);
+
+        self.make_reshape("/model/reshape_sliced_logits", ["/model/slice_logits/output_0", "/model/constants/TensorProto.INT64/1D/-1, 32064"], TensorProto.FLOAT, ["unk", 32064])
+
+        softmaxcrossentropy_inputs = [
+            "/model/reshape_sliced_logits/output_0",
+            "/model/cast_sliced_labels/output_0"
+        ]
+
+        loss_output = "loss"
+        self.make_node("SoftmaxCrossEntropyLoss", inputs=softmaxcrossentropy_inputs, outputs=[loss_output], name=name)
+        self.make_value_info(loss_output, TensorProto.FLOAT, None)
+
     def make_model(self, input_path):
         # Make inputs and outputs to ONNX model
         self.make_inputs_and_outputs()
@@ -1224,6 +1272,8 @@ class Model:
                     # Language modeling head (SkipLayerNorm --> logits)
                     print("Reading LM head")
                     self.make_lm_head(module)
+
+        self.make_loss("/model/softmax_crossentropy_loss")
 
         del model
 
